@@ -1,23 +1,80 @@
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
+from dataclasses import dataclass, field
 from databricks import sql
 import autogen
 from autogen import AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
 from autogen.agentchat.contrib.text_analyzer_agent import TextAnalyzerAgent
 from autogen.agentchat.contrib.retrieve_user_proxy_agent import RetrieveUserProxyAgent
-from .base_agent import BaseAgent
+from .base_agent import BaseAgent, AgentState
 from ..config import Config, AgentConfig
 from ..embeddings import get_embedding_store
 from loguru import logger
 import json
+import time
+import aiohttp
+from graphql import build_schema, parse, validate
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores.pgvector import PGVector
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import psycopg2
+from psycopg2.extras import Json
+
+@dataclass
+class DatabricksState(AgentState):
+    """Extended state for Databricks agent."""
+    schema_cache: Dict[str, Any] = field(default_factory=dict)
+    last_schema_update: float = 0.0
+    current_query: Optional[str] = None
+    query_results: Optional[Dict[str, Any]] = None
+    schema_cache_ttl: int = 3600  # 1 hour
+    vector_store: Optional[PGVector] = None
 
 class DatabricksAgent(BaseAgent):
     def __init__(self, config: Config, agent_config: AgentConfig):
         super().__init__(config, agent_config)
         self.connection_params = agent_config.connection
         self.embedding_store = get_embedding_store(config.embedding)
-        self._schema_cache = {}
-        self._last_schema_update = 0
+        self.state = DatabricksState(
+            schema_cache_ttl=agent_config.connection.get('schema_cache_ttl', 3600)
+        )
+        self._initialize_vector_store()
         self.group_chat = self._create_group_chat()
+
+    def _initialize_vector_store(self):
+        """Initialize pgvector store for schema embeddings."""
+        try:
+            # Initialize embeddings
+            embeddings = OpenAIEmbeddings(
+                openai_api_key=self.config.llm.api_key
+            )
+
+            # Initialize text splitter
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200
+            )
+
+            # Initialize pgvector store
+            connection_string = PGVector.connection_string_from_db_params(
+                driver="psycopg2",
+                host=self.config.embedding.connection.host,
+                port=self.config.embedding.connection.port,
+                database=self.config.embedding.connection.database,
+                user=self.config.embedding.connection.user,
+                password=self.config.embedding.connection.password
+            )
+
+            self.state.vector_store = PGVector(
+                connection_string=connection_string,
+                embedding_function=embeddings,
+                collection_name="databricks_schema_embeddings",
+                pre_delete_collection=False
+            )
+
+        except Exception as e:
+            logger.error(f"Error initializing vector store: {str(e)}")
+            raise
 
     def _create_group_chat(self) -> GroupChatManager:
         """Create a group chat with specialized agents."""
@@ -134,10 +191,11 @@ class DatabricksAgent(BaseAgent):
     def _register_tools(self) -> Dict[str, Callable]:
         """Register tools for the agent."""
         return {
-            "get_schema_info": self._get_schema_info,
+            "get_schema": self.get_schema,
             "execute_query": self.execute_query,
-            "get_system_table_info": self.get_system_table_info,
-            "search_schema": self._search_schema
+            "validate_query": self.validate_query,
+            "search_schema": self.search_schema,
+            "semantic_schema_search": self.semantic_schema_search
         }
 
     async def process_message(self, message: str, context: Optional[Dict[str, Any]] = None) -> str:
@@ -148,6 +206,11 @@ class DatabricksAgent(BaseAgent):
             # Get relevant schema information
             schema_info = await self._get_relevant_schema(message)
             
+            # Update state
+            self.state.context = context or {}
+            self.state.current_query = message
+            self.state.messages.append({"role": "user", "content": message})
+
             # Prepare context with schema information
             enhanced_context = {
                 "schema_info": schema_info,
@@ -179,7 +242,11 @@ class DatabricksAgent(BaseAgent):
                 context=enhanced_context
             )
 
-            return chat_result.last_message()["content"]
+            # Update state with response
+            response = chat_result.last_message()["content"]
+            self.state.messages.append({"role": "assistant", "content": response})
+
+            return response
 
         except Exception as e:
             return await self.handle_error(e)
@@ -187,9 +254,9 @@ class DatabricksAgent(BaseAgent):
     async def _get_schema_info(self, table_name: str) -> Dict[str, Any]:
         """Get schema information for a table."""
         try:
-            if table_name not in self._schema_cache:
+            if table_name not in self.state.schema_cache:
                 await self._update_schema_cache()
-            return self._schema_cache.get(table_name, {})
+            return self.state.schema_cache.get(table_name, {})
         except Exception as e:
             logger.error(f"Error getting schema info: {str(e)}")
             raise
@@ -213,50 +280,55 @@ class DatabricksAgent(BaseAgent):
             raise
 
     async def _update_schema_cache(self):
-        """Update the schema cache with embeddings."""
+        """Update the schema cache with embeddings using pgvector."""
         try:
-            with sql.connect(**self.connection_params) as conn:
-                with conn.cursor() as cursor:
-                    # Get all tables
-                    cursor.execute("SHOW TABLES")
-                    tables = cursor.fetchall()
-                    
-                    # Get schema for each table
-                    for table in tables:
-                        table_name = table[0]
-                        cursor.execute(f"DESCRIBE {table_name}")
-                        columns = cursor.fetchall()
-                        
-                        # Store schema info
-                        schema_info = {
-                            "table_name": table_name,
-                            "columns": [
-                                {
-                                    "name": col[0],
-                                    "type": col[1],
-                                    "description": col[2] if len(col) > 2 else None
-                                }
-                                for col in columns
-                            ]
-                        }
-                        self._schema_cache[table_name] = schema_info
-                        
-                        # Store schema embedding
-                        schema_text = f"Table {table_name}: " + ", ".join(
-                            f"{col['name']} ({col['type']})"
-                            for col in schema_info["columns"]
-                        )
-                        await self.embedding_store.store_embeddings(
-                            [await self.embedding_store.get_embedding(schema_text)],
-                            [{
-                                "type": "schema",
-                                "table_name": table_name,
-                                "content": schema_text,
-                                "schema_info": schema_info
-                            }]
-                        )
+            # Get schema from endpoint
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.connection_params['endpoint'],
+                    json={'query': '{ __schema { types { name fields { name type { name kind ofType { name kind } } } } } }'}
+                ) as response:
+                    schema_data = await response.json()
             
-            self._last_schema_update = time.time()
+            # Build schema
+            schema = build_schema(schema_data['data']['__schema'])
+            
+            # Store in cache
+            self.state.schema_cache = schema
+            
+            # Create documents for each type and field
+            docs = []
+            for type_name, type_info in schema.type_map.items():
+                if not type_name.startswith("__"):
+                    # Create document for type
+                    type_doc = Document(
+                        page_content=f"Type: {type_name}\nKind: {type_info.kind}",
+                        metadata={
+                            "type": "schema_type",
+                            "name": type_name,
+                            "kind": type_info.kind
+                        }
+                    )
+                    docs.append(type_doc)
+                    
+                    # Create documents for fields
+                    if hasattr(type_info, "fields"):
+                        for field_name, field_info in type_info.fields.items():
+                            field_doc = Document(
+                                page_content=f"Field: {field_name}\nType: {field_info.type}\nParent Type: {type_name}",
+                                metadata={
+                                    "type": "schema_field",
+                                    "name": field_name,
+                                    "parent_type": type_name,
+                                    "field_type": str(field_info.type)
+                                }
+                            )
+                            docs.append(field_doc)
+            
+            # Add documents to vector store
+            self.state.vector_store.add_documents(docs)
+            
+            self.state.last_schema_update = time.time()
             
         except Exception as e:
             logger.error(f"Error updating schema cache: {str(e)}")
@@ -271,11 +343,14 @@ class DatabricksAgent(BaseAgent):
                     results = cursor.fetchall()
                     columns = [desc[0] for desc in cursor.description]
                     
-                    return {
+                    # Update state with query results
+                    self.state.query_results = {
                         "columns": columns,
                         "rows": results,
                         "row_count": len(results)
                     }
+                    
+                    return self.state.query_results
                     
         except Exception as e:
             logger.error(f"Error executing query: {str(e)}")
@@ -293,4 +368,27 @@ class DatabricksAgent(BaseAgent):
             
         except Exception as e:
             logger.error(f"Error getting system table info: {str(e)}")
+            raise
+
+    async def semantic_schema_search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
+        """Perform semantic search on schema using pgvector."""
+        try:
+            # Search vector store
+            docs = self.state.vector_store.similarity_search(
+                query=query,
+                k=k
+            )
+            
+            # Format results
+            results = []
+            for doc in docs:
+                results.append({
+                    "content": doc.page_content,
+                    "metadata": doc.metadata,
+                    "score": doc.metadata.get("score", 0.0)
+                })
+            
+            return results
+        except Exception as e:
+            logger.error(f"Error in semantic schema search: {str(e)}")
             raise 

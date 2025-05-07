@@ -1,94 +1,83 @@
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 import yaml
 from pydantic import BaseModel, Field
 import os
 from dotenv import load_dotenv
+from dataclasses import dataclass, field
 
 load_dotenv()
 
-class LLMConfig(BaseModel):
+@dataclass
+class LLMConfig:
     provider: str
     model: str
-    temperature: float
-    max_tokens: int
-    region: str = None
+    temperature: float = 0.7
+    max_tokens: int = 4096
+    region: Optional[str] = None
+    api_key: Optional[str] = None
 
-class EmbeddingConfig(BaseModel):
-    store: str
-    dimension: int
-    connection: Dict[str, Any] = None
+@dataclass
+class EmbeddingConfig:
+    type: str  # "in_memory" or "pgvector"
+    dimension: int = 1536
+    connection: Optional[Dict[str, Any]] = None
 
-class DatabaseConfig(BaseModel):
-    type: str
-    path: str = None
-    connection: Dict[str, Any] = None
+@dataclass
+class DatabaseConfig:
+    type: str  # "sqlite" or "postgresql"
+    path: Optional[str] = None
+    connection: Optional[Dict[str, Any]] = None
 
-class AgentConfig(BaseModel):
+@dataclass
+class GroupChatConfig:
+    max_round: int = 10
+    speaker_selection_method: str = "round_robin"
+    roles: Dict[str, str] = field(default_factory=dict)
+
+@dataclass
+class AgentConfig:
     name: str
     description: str
-    max_iterations: int
-    timeout: int
-    connection: Dict[str, Any] = None
-    embedding_batch_size: int = None
-    schema_cache_ttl: int = None
+    max_iterations: int = 5
+    connection: Optional[Dict[str, Any]] = None
+    group_chat: GroupChatConfig = field(default_factory=GroupChatConfig)
 
-class MemoryConfig(BaseModel):
-    type: str
-    host: str
-    port: int
-    db: int
-    ttl: int
-    password: str = None
-
-class LoggingConfig(BaseModel):
-    level: str
-    format: str
-    file: str
-    max_size: int = None
-    backup_count: int = None
-
-class APIConfig(BaseModel):
-    host: str
-    port: int
-    debug: bool
-    workers: int
-    timeout: int = None
-    rate_limit: Dict[str, int] = None
-
-class MonitoringConfig(BaseModel):
-    prometheus: Dict[str, Any] = None
-    health_check: Dict[str, int] = None
-
-class Config(BaseModel):
+@dataclass
+class Config:
+    env: str
     llm: LLMConfig
     embedding: EmbeddingConfig
     database: DatabaseConfig
+    memory: DatabaseConfig
     agents: Dict[str, AgentConfig]
-    memory: MemoryConfig
-    logging: LoggingConfig
-    api: APIConfig
-    monitoring: MonitoringConfig = None
+    logging: Dict[str, Any] = field(default_factory=dict)
+    api: Dict[str, Any] = field(default_factory=dict)
+    monitoring: Dict[str, Any] = field(default_factory=dict)
 
 def load_config(config_path: str) -> Config:
     """Load configuration from YAML file."""
     with open(config_path, 'r') as f:
         config_dict = yaml.safe_load(f)
     
-    # Replace environment variables
-    def replace_env_vars(obj):
-        if isinstance(obj, dict):
-            return {k: replace_env_vars(v) for k, v in obj.items()}
-        elif isinstance(obj, str) and obj.startswith('${') and obj.endswith('}'):
-            env_var = obj[2:-1]
-            return os.getenv(env_var)
-        return obj
-
-    config_dict = replace_env_vars(config_dict)
+    # Convert nested dictionaries to appropriate dataclass instances
+    config_dict['llm'] = LLMConfig(**config_dict['llm'])
+    config_dict['embedding'] = EmbeddingConfig(**config_dict['embedding'])
+    config_dict['database'] = DatabaseConfig(**config_dict['database'])
+    config_dict['memory'] = DatabaseConfig(**config_dict['memory'])
+    
+    # Convert agent configs
+    agents = {}
+    for name, agent_config in config_dict['agents'].items():
+        if 'group_chat' in agent_config:
+            agent_config['group_chat'] = GroupChatConfig(**agent_config['group_chat'])
+        agents[name] = AgentConfig(**agent_config)
+    config_dict['agents'] = agents
+    
     return Config(**config_dict)
 
-def get_config(env: str = "local") -> Config:
+def get_config() -> Config:
     """Get configuration based on environment."""
-    config_dir = Path(__file__).parent.parent.parent / "config"
-    config_path = config_dir / f"{env}_config.yaml"
+    env = os.getenv('ENV', 'development')
+    config_path = Path(__file__).parent.parent.parent / 'config' / f'{env}_config.yaml'
     return load_config(str(config_path)) 

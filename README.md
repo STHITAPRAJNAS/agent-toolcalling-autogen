@@ -1,124 +1,107 @@
 # Agentic Knowledge System
 
-A powerful multi-agent system for knowledge retrieval and question answering, built with AutoGen and FastAPI.
+A powerful multi-agent system built with AutoGen and LangChain for intelligent knowledge retrieval and analysis across multiple data sources.
 
 ## Features
 
-- 🤖 Multi-agent system with specialized agents for:
-  - Confluence knowledge base
-  - Databricks SQL and system tables
-  - GraphQL APIs
-- 🔍 Vector-based semantic search
-- 💬 Natural language to SQL/GraphQL conversion
-- 📝 Persistent conversation history
-- 🚀 Production-ready FastAPI backend
-- 🔄 AutoGen group chat patterns
-- 🛠️ Tool-calling capabilities
-- 📊 Structured database storage
+- **Multi-Agent Architecture**: Specialized agents for different data sources (Confluence, Databricks, GraphQL)
+- **Intelligent Retrieval**: Vector-based semantic search using pgvector/SQLite
+- **Group Chat Pattern**: Collaborative problem-solving using AutoGen's group chat
+- **State Management**: Robust state tracking using dataclasses
+- **Production Ready**: Configurable for both local development and production environments
 
-## Quick Start
+## Components
 
-### Prerequisites
+### Core Agents
 
-- Python 3.10+
-- [UV](https://github.com/astral-sh/uv) (recommended) or pip
-- PostgreSQL (for production) or SQLite (for local development)
+1. **Supervisor Agent**
+   - Coordinates between specialized agents
+   - Manages conversation flow
+   - Synthesizes responses from multiple sources
 
-### Installation
+2. **Confluence Agent**
+   - Searches and analyzes Confluence content
+   - Uses LangChain retrievers for efficient content retrieval
+   - Maintains vector embeddings of content
+
+3. **Databricks Agent**
+   - Queries and analyzes Databricks data
+   - Schema-aware query generation
+   - Vector-based schema search
+
+4. **GraphQL Agent**
+   - Queries and analyzes GraphQL APIs
+   - Schema validation and optimization
+   - Intelligent query construction
+
+### Storage
+
+- **Vector Storage**:
+  - Production: pgvector (PostgreSQL)
+  - Local: SQLite with vector support
+- **Conversation Storage**:
+  - Production: PostgreSQL
+  - Local: SQLite
+
+## Installation
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/agentic-knowledge-system.git
+git clone https://github.com/your-username/agentic-knowledge-system.git
 cd agentic-knowledge-system
 ```
 
-2. Install dependencies using UV (recommended):
+2. Create and activate a virtual environment:
 ```bash
-# Install UV if you haven't already
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Create and activate virtual environment
-uv venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-
-# Install dependencies
-uv pip install -r requirements.txt
+python -m venv venv
+source venv/bin/activate  # Linux/Mac
+.\venv\Scripts\activate   # Windows
 ```
 
-Or using pip:
+3. Install dependencies:
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. Configure the environment:
+4. Set up environment variables:
 ```bash
-# Copy example config
 cp .env.example .env
-
-# Edit .env with your settings
+# Edit .env with your configuration
 ```
 
-### Configuration
+## Configuration
 
-The system supports two modes:
+The system supports two configuration modes:
 
-1. **Local Development** (`config/local_config.yaml`):
-   - Uses SQLite for conversation storage
-   - In-memory embeddings
-   - Local file-based logging
-   - Development-friendly settings
+### Local Development
+- Uses SQLite for storage
+- OpenAI for LLM
+- Local file-based logging
+- Debug mode enabled
 
-2. **Production** (`config/production_config.yaml`):
-   - PostgreSQL with pgvector for storage
-   - Bedrock or Gemini for LLM
-   - Structured logging
-   - Production-ready settings
+### Production
+- Uses PostgreSQL with pgvector
+- AWS Bedrock for LLM
+- Production-grade monitoring
+- Rate limiting and security features
 
-### Running the Application
+## Usage
 
-1. Start the FastAPI server:
+1. Start the API server:
 ```bash
 python src/run.py
 ```
 
-The API will be available at `http://localhost:8000`
+2. The API will be available at:
+- Local: http://localhost:8000
+- Production: https://your-domain.com
 
-## API Usage
+### API Endpoints
 
-### Chat Endpoint
-```bash
-curl -X POST http://localhost:8000/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "What are the recent changes in the sales data?",
-    "user_id": "user123",
-    "conversation_id": "conv456"
-  }'
-```
-
-### Conversation Management
-```bash
-# Get recent conversations
-curl http://localhost:8000/conversations/user123
-
-# Get conversation history
-curl http://localhost:8000/conversations/conv456/history
-
-# Clear conversation
-curl -X DELETE http://localhost:8000/conversations/conv456
-```
-
-### Search
-```bash
-curl "http://localhost:8000/search?query=sales%20data&user_id=user123&limit=5"
-```
-
-### Health Check
-```bash
-curl http://localhost:8000/health
-```
+- `POST /chat`: Send messages to the agent system
+- `GET /conversations`: List recent conversations
+- `GET /search`: Search across all data sources
+- `GET /health`: Health check endpoint
 
 ## Development
 
@@ -129,42 +112,37 @@ curl http://localhost:8000/health
 │   ├── local_config.yaml
 │   └── production_config.yaml
 ├── src/
-│   ├── api/
-│   │   └── app.py
 │   ├── core/
 │   │   ├── agents/
-│   │   │   ├── base_agent.py
-│   │   │   ├── supervisor_agent.py
-│   │   │   ├── confluence_agent.py
-│   │   │   ├── databricks_agent.py
-│   │   │   └── graphql_agent.py
 │   │   ├── memory.py
-│   │   └── embeddings.py
+│   │   └── config.py
+│   ├── api/
 │   └── run.py
 ├── tests/
-├── .env.example
-├── requirements.txt
-└── README.md
+├── data/
+└── logs/
 ```
 
 ### Adding New Agents
 
 1. Create a new agent class in `src/core/agents/`
-2. Inherit from `BaseAgent`
-3. Implement required methods:
-   - `_get_system_message()`
+2. Implement required methods:
+   - `_create_group_chat()`
    - `_register_tools()`
    - `process_message()`
+3. Add configuration in `config/*.yaml`
 
-### Testing
+## Monitoring
 
-```bash
-# Run tests
-pytest
+### Local
+- Basic health checks
+- Log file monitoring
 
-# Run with coverage
-pytest --cov=src
-```
+### Production
+- Prometheus metrics
+- Jaeger tracing
+- Rate limiting
+- Health checks
 
 ## Contributing
 

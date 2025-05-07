@@ -1,155 +1,286 @@
-from typing import Dict, Any, List, Optional
-from gql import Client, gql
-from gql.transport.requests import RequestsHTTPTransport
-from .base_agent import BaseAgent
+from typing import Dict, Any, List, Optional, Callable
+from dataclasses import dataclass, field
+import autogen
+from autogen import AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
+from autogen.agentchat.contrib.text_analyzer_agent import TextAnalyzerAgent
+from autogen.agentchat.contrib.retrieve_user_proxy_agent import RetrieveUserProxyAgent
+from .base_agent import BaseAgent, AgentState
 from ..config import Config, AgentConfig
+from ..embeddings import get_embedding_store
 from loguru import logger
 import json
+import time
+import aiohttp
+from graphql import build_schema, parse, validate
+
+@dataclass
+class GraphQLState(AgentState):
+    """Extended state for GraphQL agent."""
+    schema_cache: Dict[str, Any] = field(default_factory=dict)
+    last_schema_update: float = 0.0
+    current_query: Optional[str] = None
+    query_results: Optional[Dict[str, Any]] = None
+    schema_cache_ttl: int = 3600  # 1 hour
 
 class GraphQLAgent(BaseAgent):
     def __init__(self, config: Config, agent_config: AgentConfig):
         super().__init__(config, agent_config)
-        self.endpoints = agent_config.connection.get("endpoints", {})
-        self._schema_cache = {}
-        self._last_schema_update = 0
+        self.connection_params = agent_config.connection
+        self.embedding_store = get_embedding_store(config.embedding)
+        self.state = GraphQLState(
+            schema_cache_ttl=agent_config.connection.get('schema_cache_ttl', 3600)
+        )
+        self.group_chat = self._create_group_chat()
+
+    def _create_group_chat(self) -> GroupChatManager:
+        """Create a group chat with specialized agents."""
+        # Create schema expert agent
+        schema_expert = AssistantAgent(
+            name="SchemaExpert",
+            llm_config=self.llm_config,
+            system_message="""You are an expert in GraphQL schema analysis.
+            Your role is to:
+            1. Understand schema structure
+            2. Identify relevant types and fields
+            3. Explain schema relationships
+            4. Suggest optimal queries
+            
+            Use the provided tools to:
+            1. Get schema information
+            2. Analyze type relationships
+            3. Validate schema access
+            4. Explain schema structure"""
+        )
+
+        # Create query expert agent
+        query_expert = AssistantAgent(
+            name="QueryExpert",
+            llm_config=self.llm_config,
+            system_message="""You are an expert in GraphQL query construction.
+            Your role is to:
+            1. Generate efficient queries
+            2. Validate query syntax
+            3. Optimize query performance
+            4. Handle complex queries
+            
+            Use the provided tools to:
+            1. Execute queries
+            2. Validate syntax
+            3. Analyze performance
+            4. Suggest improvements"""
+        )
+
+        # Create text analyzer agent
+        text_analyzer = TextAnalyzerAgent(
+            name="TextAnalyzer",
+            llm_config=self.llm_config,
+            system_message="""You are an expert at analyzing text and determining its intent.
+            Your role is to:
+            1. Analyze user questions
+            2. Identify key topics and requirements
+            3. Determine which agents are needed
+            4. Extract relevant context
+            5. Guide the conversation flow"""
+        )
+
+        # Create group chat
+        group_chat = GroupChat(
+            agents=[
+                self.agent,
+                schema_expert,
+                query_expert,
+                text_analyzer
+            ],
+            messages=[],
+            max_round=self.agent_config.group_chat.max_round,
+            speaker_selection_method="round_robin"
+        )
+
+        return GroupChatManager(
+            groupchat=group_chat,
+            llm_config=self.llm_config
+        )
 
     def _get_system_message(self) -> str:
         return f"""You are {self.agent_config.name}, {self.agent_config.description}.
         You are an expert at:
-        1. Understanding GraphQL schemas and types
-        2. Converting natural language questions into GraphQL queries
-        3. Working with multiple GraphQL endpoints
-        4. Analyzing and explaining query results
+        1. Understanding GraphQL schemas
+        2. Converting natural language to GraphQL queries
+        3. Executing and validating queries
+        4. Analyzing query results
+        
+        You have access to the following tools:
+        1. get_schema: Get GraphQL schema information
+        2. execute_query: Execute GraphQL queries
+        3. validate_query: Validate query syntax
+        4. search_schema: Search for relevant types and fields
         
         When answering questions:
-        1. First, understand the relevant GraphQL schema
-        2. Generate appropriate GraphQL queries
-        3. Execute queries and analyze results
-        4. Provide clear explanations with the data
-        5. Include the GraphQL query used when relevant
+        1. First, understand the schema structure
+        2. Generate appropriate queries
+        3. Execute and validate queries
+        4. Provide clear explanations
+        5. Include the query used when relevant
         6. Handle errors gracefully and suggest alternatives"""
+
+    def _register_tools(self) -> Dict[str, Callable]:
+        """Register tools for the agent."""
+        return {
+            "get_schema": self.get_schema,
+            "execute_query": self.execute_query,
+            "validate_query": self.validate_query,
+            "search_schema": self.search_schema
+        }
 
     async def process_message(self, message: str, context: Optional[Dict[str, Any]] = None) -> str:
         try:
             # Update schema cache if needed
             await self._update_schema_cache()
             
-            # Get relevant schema information
-            schema_info = self._get_relevant_schema(message)
-            
-            # Prepare context with schema information
-            enhanced_context = {
-                "schema_info": schema_info,
-                **(context or {})
-            }
+            # Update state
+            self.state.context = context or {}
+            self.state.current_query = message
+            self.state.messages.append({"role": "user", "content": message})
 
-            # Process the message with enhanced context
-            return await super().process_message(message, enhanced_context)
+            # Create a user proxy agent for this interaction
+            user_proxy = RetrieveUserProxyAgent(
+                name="user_proxy",
+                human_input_mode="NEVER",
+                max_consecutive_auto_reply=0,
+                code_execution_config={
+                    "work_dir": "workspace",
+                    "use_docker": False,
+                    "last_n_messages": 3
+                }
+            )
+
+            # Register tools
+            for tool_name, tool_func in self.tools.items():
+                user_proxy.register_function(
+                    function_map={tool_name: tool_func}
+                )
+
+            # Initiate the group chat
+            chat_result = await user_proxy.initiate_chat(
+                self.group_chat,
+                message=message,
+                context=self.state.context
+            )
+
+            # Update state with response
+            response = chat_result.last_message()["content"]
+            self.state.messages.append({"role": "assistant", "content": response})
+
+            return response
 
         except Exception as e:
             return await self.handle_error(e)
 
-    async def _update_schema_cache(self):
-        """Update the schema cache if it's expired."""
-        current_time = time.time()
-        if current_time - self._last_schema_update > self.agent_config.schema_cache_ttl:
-            try:
-                for endpoint_name, endpoint_config in self.endpoints.items():
-                    transport = RequestsHTTPTransport(
-                        url=endpoint_config["url"],
-                        headers=endpoint_config.get("headers", {}),
-                        verify=endpoint_config.get("verify", True)
-                    )
-                    
-                    client = Client(
-                        transport=transport,
-                        fetch_schema_from_transport=True
-                    )
-                    
-                    # Get the schema
-                    schema = client.schema
-                    self._schema_cache[endpoint_name] = {
-                        "types": self._extract_types(schema),
-                        "queries": self._extract_queries(schema),
-                        "mutations": self._extract_mutations(schema)
-                    }
-                
-                self._last_schema_update = current_time
-                
-            except Exception as e:
-                logger.error(f"Error updating schema cache: {str(e)}")
-                raise
-
-    def _extract_types(self, schema) -> Dict[str, Any]:
-        """Extract type information from the schema."""
-        types = {}
-        for type_name, type_info in schema.type_map.items():
-            if not type_name.startswith("__"):
-                types[type_name] = {
-                    "kind": type_info.kind,
-                    "fields": self._extract_fields(type_info)
-                }
-        return types
-
-    def _extract_fields(self, type_info) -> Dict[str, Any]:
-        """Extract field information from a type."""
-        fields = {}
-        if hasattr(type_info, "fields"):
-            for field_name, field_info in type_info.fields.items():
-                fields[field_name] = {
-                    "type": str(field_info.type),
-                    "args": self._extract_args(field_info)
-                }
-        return fields
-
-    def _extract_args(self, field_info) -> Dict[str, Any]:
-        """Extract argument information from a field."""
-        args = {}
-        if hasattr(field_info, "args"):
-            for arg_name, arg_info in field_info.args.items():
-                args[arg_name] = {
-                    "type": str(arg_info.type),
-                    "default_value": arg_info.default_value
-                }
-        return args
-
-    def _extract_queries(self, schema) -> Dict[str, Any]:
-        """Extract query information from the schema."""
-        return self._extract_fields(schema.query_type) if schema.query_type else {}
-
-    def _extract_mutations(self, schema) -> Dict[str, Any]:
-        """Extract mutation information from the schema."""
-        return self._extract_fields(schema.mutation_type) if schema.mutation_type else {}
-
-    def _get_relevant_schema(self, query: str) -> Dict[str, Any]:
-        """Get schema information relevant to the query."""
-        # This is a simplified version - in practice, you'd want to use
-        # semantic search to find relevant types and fields
-        return self._schema_cache
-
-    async def execute_query(self, endpoint_name: str, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Execute a GraphQL query and return the results."""
+    async def get_schema(self) -> Dict[str, Any]:
+        """Get GraphQL schema information."""
         try:
-            endpoint_config = self.endpoints[endpoint_name]
-            transport = RequestsHTTPTransport(
-                url=endpoint_config["url"],
-                headers=endpoint_config.get("headers", {}),
-                verify=endpoint_config.get("verify", True)
+            # Check if schema cache is valid
+            if (time.time() - self.state.last_schema_update) > self.state.schema_cache_ttl:
+                await self._update_schema_cache()
+            
+            return self.state.schema_cache
+        except Exception as e:
+            logger.error(f"Error getting schema: {str(e)}")
+            raise
+
+    async def execute_query(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Execute a GraphQL query."""
+        try:
+            # Validate query first
+            await self.validate_query(query)
+            
+            # Execute query
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.connection_params['endpoint'],
+                    json={
+                        'query': query,
+                        'variables': variables or {}
+                    },
+                    headers=self.connection_params.get('headers', {})
+                ) as response:
+                    result = await response.json()
+                    
+                    # Update state
+                    self.state.query_results = result
+                    self.state.current_query = query
+                    
+                    return result
+        except Exception as e:
+            logger.error(f"Error executing query: {str(e)}")
+            raise
+
+    async def validate_query(self, query: str) -> bool:
+        """Validate GraphQL query syntax."""
+        try:
+            # Get schema
+            schema = await self.get_schema()
+            
+            # Parse and validate query
+            document = parse(query)
+            validation_errors = validate(schema, document)
+            
+            if validation_errors:
+                raise ValueError(f"Query validation errors: {validation_errors}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error validating query: {str(e)}")
+            raise
+
+    async def search_schema(self, query: str) -> List[Dict[str, Any]]:
+        """Search for relevant types and fields in the schema."""
+        try:
+            # Get query embedding
+            query_embedding = await self.embedding_store.get_embedding(query)
+            
+            # Search for similar schema entries
+            results = await self.embedding_store.search(
+                query_embedding,
+                top_k=5,
+                filter={"type": "graphql_schema"}
             )
             
-            client = Client(
-                transport=transport,
-                fetch_schema_from_transport=True
+            return results
+        except Exception as e:
+            logger.error(f"Error searching schema: {str(e)}")
+            raise
+
+    async def _update_schema_cache(self):
+        """Update the schema cache with embeddings."""
+        try:
+            # Get schema from endpoint
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.connection_params['endpoint'],
+                    json={'query': '{ __schema { types { name fields { name type { name kind ofType { name kind } } } } } }'}
+                ) as response:
+                    schema_data = await response.json()
+            
+            # Build schema
+            schema = build_schema(schema_data['data']['__schema'])
+            
+            # Store in cache
+            self.state.schema_cache = schema
+            
+            # Store schema embedding
+            schema_text = str(schema)
+            await self.embedding_store.store_embeddings(
+                [await self.embedding_store.get_embedding(schema_text)],
+                [{
+                    "type": "graphql_schema",
+                    "content": schema_text,
+                    "schema": schema
+                }]
             )
             
-            # Execute the query
-            result = await client.execute_async(
-                gql(query),
-                variable_values=variables
-            )
-            
-            return result
+            self.state.last_schema_update = time.time()
             
         except Exception as e:
-            logger.error(f"Error executing GraphQL query: {str(e)}")
+            logger.error(f"Error updating schema cache: {str(e)}")
             raise 

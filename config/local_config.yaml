@@ -1,12 +1,18 @@
 llm:
-  provider: "gemini"
-  model: "gemini-pro"
+  provider: "openai"
+  model: "gpt-4-turbo-preview"
   temperature: 0.7
   max_tokens: 4096
+  api_key: "${OPENAI_API_KEY}"
 
 embedding:
-  store: "memory"
+  type: "sqlite"  # Use SQLite for local development
+  connection:
+    path: "data/embeddings.db"
   dimension: 1536
+  collection_names:
+    confluence: "confluence_embeddings"
+    databricks: "databricks_schema_embeddings"
 
 database:
   type: "sqlite"
@@ -16,44 +22,67 @@ agents:
   supervisor:
     name: "Supervisor"
     description: "Coordinates between specialized agents"
-    max_iterations: 10
-    timeout: 300
     group_chat:
       max_round: 10
-      agents:
+      roles:
         - name: "Coordinator"
-          role: "Analyze questions and coordinate between agents"
+          description: "Analyzes questions and coordinates responses"
         - name: "Synthesizer"
-          role: "Combine responses from multiple agents"
+          description: "Combines responses from multiple sources"
 
   confluence:
-    name: "ConfluenceExpert"
-    description: "Expert in retrieving information from Confluence"
-    max_iterations: 5
-    timeout: 120
-    embedding_batch_size: 100
+    name: "Confluence"
+    description: "Searches and analyzes Confluence content"
+    connection:
+      url: "${CONFLUENCE_URL}"
+      username: "${CONFLUENCE_USERNAME}"
+      password: "${CONFLUENCE_PASSWORD}"
+      space_key: "${CONFLUENCE_SPACE_KEY}"
+      embedding_batch_size: 100
+    group_chat:
+      max_round: 8
+      roles:
+        - name: "ContentExpert"
+          description: "Analyzes and understands content"
+        - name: "SearchExpert"
+          description: "Handles search and retrieval"
+        - name: "TextAnalyzer"
+          description: "Analyzes user intent"
 
   databricks:
-    name: "DatabricksExpert"
-    description: "Expert in Databricks SQL and system tables"
-    max_iterations: 5
-    timeout: 120
+    name: "Databricks"
+    description: "Queries and analyzes Databricks data"
+    connection:
+      host: "${DATABRICKS_HOST}"
+      port: 443
+      http_path: "${DATABRICKS_HTTP_PATH}"
+      access_token: "${DATABRICKS_ACCESS_TOKEN}"
+      schema_cache_ttl: 3600
     group_chat:
-      max_round: 10
-      agents:
+      max_round: 8
+      roles:
         - name: "SQLExpert"
-          role: "Generate and optimize SQL queries"
+          description: "Generates and optimizes SQL queries"
         - name: "SchemaExpert"
-          role: "Analyze database schemas"
+          description: "Analyzes database schema"
         - name: "QueryValidator"
-          role: "Validate and improve queries"
+          description: "Validates query correctness"
 
   graphql:
-    name: "GraphQLExpert"
-    description: "Expert in GraphQL queries and schema"
-    max_iterations: 5
-    timeout: 120
-    schema_cache_ttl: 3600
+    name: "GraphQL"
+    description: "Queries and analyzes GraphQL APIs"
+    connection:
+      endpoint: "${GRAPHQL_ENDPOINT}"
+      headers:
+        Authorization: "Bearer ${GRAPHQL_TOKEN}"
+      schema_cache_ttl: 3600
+    group_chat:
+      max_round: 8
+      roles:
+        - name: "SchemaExpert"
+          description: "Analyzes GraphQL schema"
+        - name: "QueryExpert"
+          description: "Generates GraphQL queries"
 
 memory:
   type: "sqlite"
@@ -65,7 +94,12 @@ logging:
   file: "logs/app.log"
 
 api:
-  host: "0.0.0.0"
+  host: "localhost"
   port: 8000
   debug: true
-  workers: 2 
+  cors_origins: ["*"]
+
+monitoring:
+  enabled: true
+  metrics_port: 9090
+  health_check_interval: 30 

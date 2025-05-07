@@ -1,4 +1,5 @@
 from typing import Dict, Any, Optional, List, Callable
+from dataclasses import dataclass, field
 import autogen
 from autogen import AssistantAgent, UserProxyAgent, GroupChat, GroupChatManager
 from autogen.agentchat.contrib.text_analyzer_agent import TextAnalyzerAgent
@@ -8,12 +9,22 @@ from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 from ..config import Config, AgentConfig
 
+@dataclass
+class AgentState:
+    """State management for agents."""
+    conversation_id: Optional[str] = None
+    user_id: Optional[str] = None
+    context: Dict[str, Any] = field(default_factory=dict)
+    tools: Dict[str, Callable] = field(default_factory=dict)
+    messages: List[Dict[str, Any]] = field(default_factory=list)
+
 class BaseAgent:
     def __init__(self, config: Config, agent_config: AgentConfig):
         self.config = config
         self.agent_config = agent_config
         self.llm_config = self._create_llm_config()
         self.agent = self._create_agent()
+        self.state = AgentState()
         self.tools = self._register_tools()
 
     def _create_llm_config(self) -> Dict[str, Any]:
@@ -77,6 +88,10 @@ class BaseAgent:
     async def process_message(self, message: str, context: Optional[Dict[str, Any]] = None) -> str:
         """Process a message and return a response."""
         try:
+            # Update agent state
+            self.state.context = context or {}
+            self.state.messages.append({"role": "user", "content": message})
+
             # Create a user proxy agent for this interaction
             user_proxy = RetrieveUserProxyAgent(
                 name="user_proxy",
@@ -105,7 +120,11 @@ class BaseAgent:
                 message=message
             )
 
-            return chat_result.last_message()["content"]
+            # Update state with response
+            response = chat_result.last_message()["content"]
+            self.state.messages.append({"role": "assistant", "content": response})
+
+            return response
 
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")

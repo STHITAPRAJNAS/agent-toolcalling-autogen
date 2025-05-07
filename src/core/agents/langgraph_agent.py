@@ -31,12 +31,14 @@ from functools import wraps
 import hashlib
 
 class IntentType(str, Enum):
+    """Types of user intents."""
     CONFLUENCE = "confluence"
     DATABRICKS = "databricks"
     BOTH = "both"
     UNKNOWN = "unknown"
 
 class ActionType(str, Enum):
+    """Types of agent actions."""
     RETRIEVE = "retrieve"
     GENERATE_SQL = "generate_sql"
     EXECUTE_SQL = "execute_sql"
@@ -51,24 +53,6 @@ class ToolCallPattern(str, Enum):
     RETRY = "retry"           # Retry failed tool calls
     CACHED = "cached"         # Use cached results when available
 
-class AgentState(TypedDict):
-    """State for the agent workflow."""
-    messages: List[BaseMessage]
-    current_question: str
-    intent: Optional[IntentType]
-    confluence_context: List[Document]
-    databricks_context: List[Document]
-    sql_query: Optional[str]
-    sql_result: Optional[Any]
-    final_answer: Optional[str]
-    error: Optional[str]
-    attempt_count: int
-    next_action: Optional[ActionType]
-    confidence: float
-    tool_calls: List[Dict[str, Any]]
-    cache_hits: int
-    retry_count: Dict[str, int]
-
 @dataclass
 class DatabricksConfig:
     """Configuration for Databricks connection."""
@@ -78,6 +62,25 @@ class DatabricksConfig:
     access_token: str
     catalog: str
     schema: str
+
+class AgentState(TypedDict):
+    """State for the agent workflow."""
+    messages: List[BaseMessage]
+    current_question: str
+    rephrased_question: Optional[str]
+    intent: Optional[IntentType]
+    confluence_context: List[Document]
+    databricks_context: List[Document]
+    sql_query: Optional[str]
+    sql_result: Optional[Any]
+    final_answer: Optional[str]
+    error: Optional[str]
+    attempt_count: int
+    tool_calls: List[Dict[str, Any]]
+    cache_hits: int
+    retry_count: Dict[str, int]
+    needs_clarification: bool
+    clarification_response: Optional[str]
 
 class SQLQuery(BaseModel):
     """Model for SQL query generation."""
@@ -89,13 +92,6 @@ class IntentClassification(BaseModel):
     intent: IntentType = Field(description="The classified intent of the question")
     confidence: float = Field(description="Confidence score of the classification")
     explanation: str = Field(description="Explanation of the classification")
-
-class AgentAction(BaseModel):
-    """Model for agent actions."""
-    action: ActionType = Field(description="The next action to take")
-    confidence: float = Field(description="Confidence in the action choice")
-    explanation: str = Field(description="Explanation of why this action was chosen")
-    parameters: Dict[str, Any] = Field(description="Parameters for the action", default_factory=dict)
 
 class ToolCallResult(BaseModel):
     """Model for tool call results."""
@@ -338,16 +334,35 @@ Generate a SQL query that answers the question. Include an explanation of what t
         
         # Add nodes
         workflow.add_node("process_input", self._process_input)
+        workflow.add_node("rephrase_question", self._rephrase_question)
+        workflow.add_node("classify_intent", self._classify_intent)
         workflow.add_node("agent_step", self._agent_step)
         workflow.add_node("handle_tool_response", self._handle_tool_response)
         workflow.add_node("generate_response", self._generate_response)
+        workflow.add_node("clarify_question", self._clarify_question)
         
         # Add edges
         workflow.add_edge(START, "process_input")
-        workflow.add_edge("process_input", "agent_step")
+        workflow.add_edge("process_input", "rephrase_question")
+        workflow.add_edge("rephrase_question", "classify_intent")
+        
+        # Add conditional edges based on intent
+        workflow.add_conditional_edges(
+            "classify_intent",
+            self._route_by_intent,
+            {
+                "confluence": "agent_step",
+                "databricks": "agent_step",
+                "both": "agent_step",
+                "clarify": "clarify_question"
+            }
+        )
+        
+        # Add edges for tool execution
         workflow.add_edge("agent_step", "handle_tool_response")
         workflow.add_edge("handle_tool_response", "agent_step")
         workflow.add_edge("agent_step", "generate_response")
+        workflow.add_edge("clarify_question", "generate_response")
         workflow.add_edge("generate_response", END)
         
         return workflow.compile(checkpointer=self.checkpointer)
@@ -361,6 +376,7 @@ Generate a SQL query that answers the question. Include an explanation of what t
         state["current_question"] = last_message.content
         
         # Initialize state
+        state["rephrased_question"] = None
         state["intent"] = None
         state["confluence_context"] = []
         state["databricks_context"] = []
@@ -369,13 +385,67 @@ Generate a SQL query that answers the question. Include an explanation of what t
         state["final_answer"] = None
         state["error"] = None
         state["attempt_count"] = 0
-        state["next_action"] = None
-        state["confidence"] = 0.0
         state["tool_calls"] = []
         state["cache_hits"] = 0
         state["retry_count"] = {}
+        state["needs_clarification"] = False
+        state["clarification_response"] = None
         
         return state
+    
+    def _rephrase_question(self, state: AgentState) -> AgentState:
+        """Rephrase the question for better retrieval."""
+        logger.info("Rephrasing question")
+        
+        system_prompt = """You are a helpful assistant that rephrases the user's question to be a standalone question optimized for retrieval.
+Do not try to expand unknown acronyms. If there are pronouns in the question please use the conversation history to get context.
+Make sure you return the original question if it cannot be rephrased."""
+        
+        messages = [
+            SystemMessage(content=system_prompt),
+            state["messages"][-1]
+        ]
+        
+        prompt = ChatPromptTemplate.from_messages(messages)
+        rephrased = self.llm.invoke(prompt)
+        state["rephrased_question"] = rephrased.content.strip()
+        
+        return state
+    
+    def _classify_intent(self, state: AgentState) -> AgentState:
+        """Classify the intent of the question."""
+        logger.info("Classifying intent")
+        
+        system_prompt = """You are an expert at classifying questions. Determine if the question is about:
+1. Confluence documentation
+2. Databricks data
+3. Both
+4. Needs clarification
+
+Return your classification with confidence score and explanation."""
+        
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=state["rephrased_question"])
+        ]
+        
+        response = self.llm.invoke(messages)
+        classification = IntentClassification.parse_raw(response.content)
+        state["intent"] = classification.intent
+        
+        return state
+    
+    def _route_by_intent(self, state: AgentState) -> str:
+        """Route the workflow based on intent."""
+        intent = state["intent"]
+        if intent == IntentType.CONFLUENCE:
+            return "confluence"
+        elif intent == IntentType.DATABRICKS:
+            return "databricks"
+        elif intent == IntentType.BOTH:
+            return "both"
+        else:
+            return "clarify"
     
     def _agent_step(self, state: AgentState) -> AgentState:
         """Execute one step of the agent's reasoning."""
@@ -409,7 +479,7 @@ If you have enough information to provide a final answer, say so.""")
         # Create messages for the LLM
         messages = [
             system_message,
-            HumanMessage(content=state["current_question"])
+            HumanMessage(content=state["rephrased_question"])
         ]
         
         # Add tool results if available
@@ -479,6 +549,25 @@ If you have enough information to provide a final answer, say so.""")
         
         return state
     
+    def _clarify_question(self, state: AgentState) -> AgentState:
+        """Generate a clarification question."""
+        logger.info("Generating clarification question")
+        
+        system_prompt = """You are a helpful assistant that asks clarifying questions when the user's question is unclear.
+Generate a question that will help understand what the user is looking for.
+Focus on the most important aspects that need clarification."""
+        
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=state["rephrased_question"])
+        ]
+        
+        response = self.llm.invoke(messages)
+        state["clarification_response"] = response.content
+        state["needs_clarification"] = True
+        
+        return state
+    
     def _generate_response(self, state: AgentState) -> AgentState:
         """Generate final response."""
         logger.info("Generating response")
@@ -492,7 +581,7 @@ Include relevant statistics about tool usage (cache hits, retries) if available.
         # Create messages for the LLM
         messages = [
             system_message,
-            HumanMessage(content=state["current_question"])
+            HumanMessage(content=state["rephrased_question"])
         ]
         
         # Add all messages from the conversation
@@ -513,6 +602,7 @@ Include relevant statistics about tool usage (cache hits, retries) if available.
         initial_state = {
             "messages": [HumanMessage(content=message)],
             "current_question": message,
+            "rephrased_question": None,
             "intent": None,
             "confluence_context": [],
             "databricks_context": [],
@@ -521,11 +611,11 @@ Include relevant statistics about tool usage (cache hits, retries) if available.
             "final_answer": None,
             "error": None,
             "attempt_count": 0,
-            "next_action": None,
-            "confidence": 0.0,
             "tool_calls": [],
             "cache_hits": 0,
-            "retry_count": {}
+            "retry_count": {},
+            "needs_clarification": False,
+            "clarification_response": None
         }
         
         # Run the graph
@@ -534,7 +624,6 @@ Include relevant statistics about tool usage (cache hits, retries) if available.
         return {
             "answer": result["final_answer"],
             "intent": result["intent"],
-            "confidence": result["confidence"],
             "confluence_context": result["confluence_context"],
             "databricks_context": result["databricks_context"],
             "sql_query": result["sql_query"],
@@ -542,7 +631,9 @@ Include relevant statistics about tool usage (cache hits, retries) if available.
             "error": result["error"],
             "tool_calls": result["tool_calls"],
             "cache_hits": result["cache_hits"],
-            "retry_count": result["retry_count"]
+            "retry_count": result["retry_count"],
+            "needs_clarification": result["needs_clarification"],
+            "clarification_response": result["clarification_response"]
         }
     
     async def astream(self, message: str, config: Optional[Dict] = None):
@@ -554,6 +645,7 @@ Include relevant statistics about tool usage (cache hits, retries) if available.
         initial_state = {
             "messages": [HumanMessage(content=message)],
             "current_question": message,
+            "rephrased_question": None,
             "intent": None,
             "confluence_context": [],
             "databricks_context": [],
@@ -562,11 +654,11 @@ Include relevant statistics about tool usage (cache hits, retries) if available.
             "final_answer": None,
             "error": None,
             "attempt_count": 0,
-            "next_action": None,
-            "confidence": 0.0,
             "tool_calls": [],
             "cache_hits": 0,
-            "retry_count": {}
+            "retry_count": {},
+            "needs_clarification": False,
+            "clarification_response": None
         }
         
         # Stream the graph

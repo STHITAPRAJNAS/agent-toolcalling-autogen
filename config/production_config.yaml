@@ -1,0 +1,106 @@
+llm:
+  provider: "bedrock"
+  model: "anthropic.claude-3-sonnet-20240229-v1:0"
+  temperature: 0.7
+  max_tokens: 4096
+  region: "us-west-2"
+
+embedding:
+  store: "pgvector"
+  dimension: 1536
+  connection:
+    host: "localhost"
+    port: 5432
+    database: "knowledge_db"
+    user: "postgres"
+    password: "${DB_PASSWORD}"
+
+database:
+  type: "postgresql"
+  connection:
+    host: "localhost"
+    port: 5432
+    database: "conversations_db"
+    user: "postgres"
+    password: "${DB_PASSWORD}"
+
+agents:
+  supervisor:
+    name: "Supervisor"
+    description: "Coordinates between specialized agents"
+    max_iterations: 10
+    timeout: 300
+    group_chat:
+      max_round: 10
+      agents:
+        - name: "Coordinator"
+          role: "Analyze questions and coordinate between agents"
+        - name: "Synthesizer"
+          role: "Combine responses from multiple agents"
+
+  confluence:
+    name: "ConfluenceExpert"
+    description: "Expert in retrieving information from Confluence"
+    max_iterations: 5
+    timeout: 120
+    embedding_batch_size: 100
+
+  databricks:
+    name: "DatabricksExpert"
+    description: "Expert in Databricks SQL and system tables"
+    max_iterations: 5
+    timeout: 120
+    group_chat:
+      max_round: 10
+      agents:
+        - name: "SQLExpert"
+          role: "Generate and optimize SQL queries"
+        - name: "SchemaExpert"
+          role: "Analyze database schemas"
+        - name: "QueryValidator"
+          role: "Validate and improve queries"
+    connection:
+      host: "${DATABRICKS_HOST}"
+      token: "${DATABRICKS_TOKEN}"
+      http_path: "${DATABRICKS_HTTP_PATH}"
+
+  graphql:
+    name: "GraphQLExpert"
+    description: "Expert in GraphQL queries and schema"
+    max_iterations: 5
+    timeout: 120
+    schema_cache_ttl: 3600
+
+memory:
+  type: "postgresql"
+  connection:
+    host: "localhost"
+    port: 5432
+    database: "conversations_db"
+    user: "postgres"
+    password: "${DB_PASSWORD}"
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "/var/log/app/app.log"
+  max_size: 10485760  # 10MB
+  backup_count: 5
+
+api:
+  host: "0.0.0.0"
+  port: 8000
+  debug: false
+  workers: 4
+  timeout: 60
+  rate_limit:
+    requests_per_minute: 100
+    burst: 20
+
+monitoring:
+  prometheus:
+    enabled: true
+    port: 9090
+  health_check:
+    interval: 30
+    timeout: 5 
